@@ -49,6 +49,29 @@ err = pgmig.Run(ctx, databaseURL, pgmig.Config{
 | `MetaSchema` | The metadata schema. Defaults to `pgmig_meta`. |
 | `AppSchema` | The application schema. When set, strict role and ACL verification runs. |
 
+## Inspect state
+
+Three read-only entry points use the same least-privilege session as
+`Migrate`:
+
+```go
+statuses, err := pgmig.Status(ctx, conn, config) // applied, pending, drift, unknown
+err = pgmig.Verify(ctx, conn, config)            // checksum and name drift only
+planned, err := pgmig.Plan(ctx, conn, config)    // what a run would apply
+```
+
+The CLI wraps them:
+
+```
+pgmig status -database-url "$DATABASE_URL" -dir ./migrations -role app_owner -json
+pgmig verify -database-url "$DATABASE_URL" -dir ./migrations -role app_owner
+pgmig apply  -database-url "$DATABASE_URL" -dir ./migrations -role app_owner -dry-run
+```
+
+`status` exits 0 even when versions are pending or drifted; `verify` exits 1
+on drift. Add `-app-schema` and `-meta-schema` to match the strict setup. The
+database URL can come from `PGMIG_DATABASE_URL` instead of the flag.
+
 ## Provisioning for strict mode
 
 Run these statements as a superuser on the target database.

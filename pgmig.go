@@ -80,6 +80,133 @@ func Run(ctx context.Context, databaseURL string, config Config) (returnErr erro
 	return Migrate(ctx, conn, config)
 }
 
+// MigrationState names the state of one migration version.
+type MigrationState string
+
+const (
+	// StateApplied means the version is recorded and matches the file.
+	StateApplied MigrationState = "applied"
+	// StatePending means the file exists and the version is not recorded.
+	StatePending MigrationState = "pending"
+	// StateDrift means the version is recorded but the file name or content changed.
+	StateDrift MigrationState = "drift"
+	// StateUnknown means the version is recorded and the file is missing.
+	StateUnknown MigrationState = "unknown"
+)
+
+// MigrationStatus describes one migration version from the files and the
+// recorded history. AppliedAt is zero unless the version is recorded. Checksum
+// is zero for unknown versions.
+type MigrationStatus struct {
+	Version   int64
+	Name      string
+	State     MigrationState
+	AppliedAt time.Time
+	Checksum  [sha256.Size]byte
+}
+
+// PlannedMigration is one migration that a run applies.
+type PlannedMigration struct {
+	Version int64
+	Name    string
+}
+
+// Status reports the state of every migration version in the history and the
+// file set. It uses the same least-privilege session requirements as Migrate
+// and does not apply migrations.
+func Status(ctx context.Context, conn *pgx.Conn, config Config) ([]MigrationStatus, error) {
+	var statuses []MigrationStatus
+	err := withMigrationSession(ctx, conn, config, func(
+		_ migrationPlan,
+		migrations []migration,
+		applied []appliedMigration,
+	) error {
+		statuses = buildMigrationStatuses(migrations, applied)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return statuses, nil
+}
+
+// Verify checks the recorded history against the migration files. It returns
+// an error on checksum or name drift and on recorded versions without a file.
+func Verify(ctx context.Context, conn *pgx.Conn, config Config) error {
+	return withMigrationSession(ctx, conn, config, func(
+		_ migrationPlan,
+		migrations []migration,
+		applied []appliedMigration,
+	) error {
+		return verifyMigrationHistory(applied, migrations)
+	})
+}
+
+// Plan returns the migrations that Migrate applies, without applying
+// them. It fails on drift or unknown recorded versions, like Migrate.
+func Plan(ctx context.Context, conn *pgx.Conn, config Config) ([]PlannedMigration, error) {
+	var planned []PlannedMigration
+	err := withMigrationSession(ctx, conn, config, func(
+		_ migrationPlan,
+		migrations []migration,
+		applied []appliedMigration,
+	) error {
+		if err := verifyMigrationHistory(applied, migrations); err != nil {
+			return err
+		}
+		for _, migration := range migrations[len(applied):] {
+			planned = append(planned, PlannedMigration{Version: migration.Version, Name: migration.Name})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return planned, nil
+}
+
+func buildMigrationStatuses(migrations []migration, applied []appliedMigration) []MigrationStatus {
+	byVersion := make(map[int64]appliedMigration, len(applied))
+	for _, recorded := range applied {
+		byVersion[recorded.Version] = recorded
+	}
+	statuses := make([]MigrationStatus, 0, len(migrations)+len(applied))
+	seen := make(map[int64]struct{}, len(migrations))
+	for _, file := range migrations {
+		seen[file.Version] = struct{}{}
+		status := MigrationStatus{Version: file.Version, Name: file.Name, Checksum: file.Checksum}
+		recorded, exists := byVersion[file.Version]
+		switch {
+		case !exists:
+			status.State = StatePending
+		case recorded.Name == file.Name &&
+			len(recorded.Checksum) == sha256.Size &&
+			bytes.Equal(recorded.Checksum, file.Checksum[:]):
+			status.State = StateApplied
+			status.AppliedAt = recorded.AppliedAt
+		default:
+			status.State = StateDrift
+			status.AppliedAt = recorded.AppliedAt
+		}
+		statuses = append(statuses, status)
+	}
+	for _, recorded := range applied {
+		if _, exists := seen[recorded.Version]; exists {
+			continue
+		}
+		statuses = append(statuses, MigrationStatus{
+			Version:   recorded.Version,
+			Name:      recorded.Name,
+			State:     StateUnknown,
+			AppliedAt: recorded.AppliedAt,
+		})
+	}
+	slices.SortFunc(statuses, func(first, second MigrationStatus) int {
+		return cmp.Compare(first.Version, second.Version)
+	})
+	return statuses
+}
+
 func migrationSchemaIdentifier(name, fallback string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -408,7 +535,30 @@ func migrationRoleIdentifier(role string) (string, error) {
 	return pgx.Identifier{role}.Sanitize(), nil
 }
 
-func migrateFS(ctx context.Context, conn *pgx.Conn, config Config) (returnErr error) {
+func migrateFS(ctx context.Context, conn *pgx.Conn, config Config) error {
+	return withMigrationSession(ctx, conn, config, func(
+		plan migrationPlan,
+		migrations []migration,
+		applied []appliedMigration,
+	) error {
+		if err := verifyMigrationHistory(applied, migrations); err != nil {
+			return err
+		}
+		for _, migration := range migrations[len(applied):] {
+			if applyErr := applyMigration(ctx, conn, plan, migration); applyErr != nil {
+				return applyErr
+			}
+		}
+		return nil
+	})
+}
+
+func withMigrationSession(
+	ctx context.Context,
+	conn *pgx.Conn,
+	config Config,
+	action func(plan migrationPlan, migrations []migration, applied []appliedMigration) error,
+) (returnErr error) {
 	plan, err := newMigrationPlan(config)
 	if err != nil {
 		return err
@@ -458,15 +608,7 @@ func migrateFS(ctx context.Context, conn *pgx.Conn, config Config) (returnErr er
 	if err != nil {
 		return err
 	}
-	if verifyMigrationHistoryErr := verifyMigrationHistory(applied, migrations); verifyMigrationHistoryErr != nil {
-		return verifyMigrationHistoryErr
-	}
-	for _, migration := range migrations[len(applied):] {
-		if applyMigrationErr := applyMigration(ctx, conn, plan, migration); applyMigrationErr != nil {
-			return applyMigrationErr
-		}
-	}
-	return nil
+	return action(plan, migrations, applied)
 }
 
 func migrationIdentityAuthorized(ctx context.Context, conn *pgx.Conn, role string) (bool, error) {
@@ -534,9 +676,10 @@ func migrationIdentityAuthorized(ctx context.Context, conn *pgx.Conn, role strin
 }
 
 type appliedMigration struct {
-	Version  int64
-	Name     string
-	Checksum []byte
+	Version   int64
+	Name      string
+	Checksum  []byte
+	AppliedAt time.Time
 }
 
 func readMigrationHistory(
@@ -751,7 +894,7 @@ func verifyMigrationDatabaseAccess(ctx context.Context, tx pgx.Tx, runtimeRole s
 
 func readAppliedMigrations(ctx context.Context, tx pgx.Tx, metaTable string) ([]appliedMigration, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT version, name, checksum
+		SELECT version, name, checksum, applied_at
 		FROM `+metaTable+`
 		ORDER BY version
 	`)
@@ -761,7 +904,7 @@ func readAppliedMigrations(ctx context.Context, tx pgx.Tx, metaTable string) ([]
 	var applied []appliedMigration
 	for rows.Next() {
 		var migration appliedMigration
-		if scanErr := rows.Scan(&migration.Version, &migration.Name, &migration.Checksum); scanErr != nil {
+		if scanErr := rows.Scan(&migration.Version, &migration.Name, &migration.Checksum, &migration.AppliedAt); scanErr != nil {
 			rows.Close()
 			return nil, fmt.Errorf("read migration history: %w", scanErr)
 		}
