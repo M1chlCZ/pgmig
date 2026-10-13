@@ -43,6 +43,12 @@ func TestMigrateIntegration(t *testing.T) {
 		{name: "unknown applied migration fails closed", run: runUnknownAppliedMigrationFailsClosed},
 		{name: "lock wait honors cancellation and releases connection", run: runLockWaitHonorsCancellation},
 		{name: "concurrent runners use one session advisory lock", run: runConcurrentRunnersUseOneAdvisoryLock},
+		{name: "lock timeout bounds the advisory lock wait", run: runLockTimeoutBoundsLockWait},
+		{name: "statement timeout bounds migrations", run: runStatementTimeoutBoundsMigrations},
+		{
+			name: "statement timeout bounds the metadata transaction",
+			run:  runStatementTimeoutBoundsMetadataTransaction,
+		},
 		{name: "migration identity is least privileged", run: runMigrationIdentityLeastPrivileged},
 		{name: "metadata ACL tampering fails closed", run: runMetadataACLTamperingFailsClosed},
 		{name: "app schema ACL tampering fails closed", run: runAppSchemaACLTamperingFailsClosed},
@@ -414,6 +420,171 @@ func runConcurrentRunnersUseOneAdvisoryLock(t *testing.T, adminURL string) {
 		t.Fatalf("migration side effects = %d rows, want 1", rows)
 	}
 	assertHistory(t, admin, 1)
+}
+
+func runLockTimeoutBoundsLockWait(t *testing.T, adminURL string) {
+	t.Helper()
+	admin := connect(t, adminURL)
+	defer func() { _ = admin.Close(context.Background()) }()
+	resetDatabase(t, admin)
+	ctx := context.Background()
+
+	if _, err := admin.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		t.Fatalf("acquire lock timeout probe lock: %v", err)
+	}
+	probeLockHeld := true
+	defer func() {
+		if !probeLockHeld {
+			return
+		}
+		var released bool
+		if err := admin.QueryRow(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey).
+			Scan(&released); err != nil || !released {
+			t.Errorf("release lock timeout probe lock: released=%t err=%v", released, err)
+		}
+	}()
+
+	migrator := connect(t, databaseURLForRole(t, adminURL, testMigratorRole, testMigratorPassword))
+	defer func() { _ = migrator.Close(ctx) }()
+	files := fstest.MapFS{"000001_lock_timeout.sql": {Data: []byte("SELECT 1;\n")}}
+	type outcome struct {
+		err     error
+		elapsed time.Duration
+	}
+	done := make(chan outcome, 1)
+	started := time.Now()
+	go func() {
+		err := Migrate(ctx, migrator, Config{
+			Role:        testOwnerRole,
+			AppSchema:   testAppSchema,
+			Files:       files,
+			LockTimeout: 300 * time.Millisecond,
+		})
+		done <- outcome{err: err, elapsed: time.Since(started)}
+	}()
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, ErrLockTimeout) {
+			t.Fatalf("lock timeout error = %v", got.err)
+		}
+		if got.elapsed < 200*time.Millisecond || got.elapsed > 5*time.Second {
+			t.Fatalf("lock timeout returned after %s", got.elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("migration did not honor the lock timeout")
+	}
+	if migrator.IsClosed() {
+		t.Fatal("bounded lock wait closed the migration connection")
+	}
+
+	if _, err := admin.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrationLockKey); err != nil {
+		t.Fatalf("release lock timeout probe lock: %v", err)
+	}
+	probeLockHeld = false
+	if err := Migrate(ctx, migrator, Config{
+		Role:        testOwnerRole,
+		AppSchema:   testAppSchema,
+		Files:       files,
+		LockTimeout: time.Second,
+	}); err != nil {
+		t.Fatalf("migration after the released probe lock: %v", err)
+	}
+	assertHistory(t, admin, 1)
+}
+
+func runStatementTimeoutBoundsMigrations(t *testing.T, adminURL string) {
+	t.Helper()
+	admin := connect(t, adminURL)
+	defer func() { _ = admin.Close(context.Background()) }()
+	resetDatabase(t, admin)
+	ctx := context.Background()
+	migrator := connect(t, databaseURLForRole(t, adminURL, testMigratorRole, testMigratorPassword))
+	defer func() { _ = migrator.Close(ctx) }()
+
+	var sessionTimeoutBefore string
+	if err := migrator.QueryRow(ctx, `SHOW statement_timeout`).Scan(&sessionTimeoutBefore); err != nil {
+		t.Fatalf("read initial session statement timeout: %v", err)
+	}
+	slow := fstest.MapFS{"000001_slow.sql": {Data: []byte("SELECT pg_sleep(2);\n")}}
+	slowErr := Migrate(ctx, migrator, Config{
+		Role:             testOwnerRole,
+		AppSchema:        testAppSchema,
+		Files:            slow,
+		StatementTimeout: 200 * time.Millisecond,
+	})
+	assertErrorContains(t, slowErr, "statement timeout")
+	assertHistory(t, admin, 0)
+
+	overridden := fstest.MapFS{
+		"000001_slow.sql": {Data: []byte("SET LOCAL statement_timeout = '5s';\nSELECT pg_sleep(0.5);\n")},
+	}
+	if err := Migrate(ctx, migrator, Config{
+		Role:             testOwnerRole,
+		AppSchema:        testAppSchema,
+		Files:            overridden,
+		StatementTimeout: 200 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("migration with its own SET LOCAL failed: %v", err)
+	}
+	assertHistory(t, admin, 1)
+
+	var sessionTimeoutAfter string
+	if err := migrator.QueryRow(ctx, `SHOW statement_timeout`).Scan(&sessionTimeoutAfter); err != nil {
+		t.Fatalf("read final session statement timeout: %v", err)
+	}
+	if sessionTimeoutAfter != sessionTimeoutBefore {
+		t.Fatalf(
+			"statement timeout leaked into the session: %q, want %q",
+			sessionTimeoutAfter,
+			sessionTimeoutBefore,
+		)
+	}
+}
+
+func runStatementTimeoutBoundsMetadataTransaction(t *testing.T, adminURL string) {
+	t.Helper()
+	admin := connect(t, adminURL)
+	defer func() { _ = admin.Close(context.Background()) }()
+	resetDatabase(t, admin)
+	ctx := context.Background()
+	migrator := connect(t, databaseURLForRole(t, adminURL, testMigratorRole, testMigratorPassword))
+	defer func() { _ = migrator.Close(ctx) }()
+
+	alpha := fstest.MapFS{"000001_alpha.sql": {Data: []byte("SELECT 1;\n")}}
+	if err := Migrate(ctx, migrator, Config{
+		Role:      testOwnerRole,
+		AppSchema: testAppSchema,
+		Files:     alpha,
+	}); err != nil {
+		t.Fatalf("apply metadata probe migration: %v", err)
+	}
+	blocker, beginErr := admin.Begin(ctx)
+	if beginErr != nil {
+		t.Fatalf("begin metadata blocker: %v", beginErr)
+	}
+	defer func() { _ = blocker.Rollback(ctx) }()
+	if _, err := blocker.Exec(ctx, `LOCK TABLE pgmig_meta.schema_migrations IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("lock migration metadata: %v", err)
+	}
+	next := fstest.MapFS{
+		"000001_alpha.sql":  {Data: []byte("SELECT 1;\n")},
+		"000002_second.sql": {Data: []byte("CREATE TABLE app.second (id integer);\n")},
+	}
+	metadataErr := Migrate(ctx, migrator, Config{
+		Role:             testOwnerRole,
+		AppSchema:        testAppSchema,
+		Files:            next,
+		StatementTimeout: 200 * time.Millisecond,
+	})
+	assertErrorContains(t, metadataErr, "statement timeout")
+	assertHistory(t, admin, 1)
+	var sideEffect bool
+	if err := admin.QueryRow(ctx, `SELECT to_regclass('app.second') IS NOT NULL`).Scan(&sideEffect); err != nil {
+		t.Fatalf("check metadata timeout side effect: %v", err)
+	}
+	if sideEffect {
+		t.Fatal("blocked metadata transaction applied a migration")
+	}
 }
 
 func runMigrationIdentityLeastPrivileged(t *testing.T, adminURL string) {

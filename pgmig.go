@@ -24,6 +24,7 @@ const (
 	migrationStatementTokenLimit       = 2
 	sqlCommentDelimiterSize            = 2
 	migrationCleanupTimeout            = 5 * time.Second
+	migrationLockPollInterval          = 100 * time.Millisecond
 )
 
 const migrationIdentifierPatternText = `^[a-z_][a-z0-9_]{0,62}$`
@@ -37,15 +38,25 @@ var (
 // DefaultMetaSchema is the schema that stores migration history.
 const DefaultMetaSchema = "pgmig_meta"
 
+// ErrLockTimeout reports that the migration advisory lock was not acquired
+// within Config.LockTimeout.
+var ErrLockTimeout = errors.New("migration lock timeout")
+
 // Config controls one migration run. Role is required. Files supplies the
 // migration set. MetaSchema defaults to DefaultMetaSchema. When AppSchema is
 // set, Migrate verifies the schema ownership, the single runtime role, and
-// the exact database ACL before it applies anything.
+// the exact database ACL before it applies anything. LockTimeout bounds the
+// wait for the migration advisory lock; zero waits indefinitely.
+// StatementTimeout bounds every statement of the migration and metadata
+// transactions; zero keeps the server session default. A migration file can
+// still override its transaction timeout with its own SET LOCAL.
 type Config struct {
-	Role       string
-	AppSchema  string
-	MetaSchema string
-	Files      fs.FS
+	Role             string
+	AppSchema        string
+	MetaSchema       string
+	Files            fs.FS
+	LockTimeout      time.Duration
+	StatementTimeout time.Duration
 }
 
 // Migrate applies every pending migration on the connection.
@@ -111,6 +122,32 @@ type PlannedMigration struct {
 	Name    string
 }
 
+// VersionInfo is the applied migration state of one metadata store.
+type VersionInfo struct {
+	// Version is the highest applied migration version, zero when the
+	// store is empty.
+	Version int64
+	// MigrationCount is the number of applied migrations.
+	MigrationCount int64
+}
+
+// Compare orders the receiver against other. It returns -1 when the receiver
+// is older, 0 when both fields match, and 1 when the receiver is newer.
+// Version is compared first, then MigrationCount.
+func (info VersionInfo) Compare(other VersionInfo) int {
+	if order := cmp.Compare(info.Version, other.Version); order != 0 {
+		return order
+	}
+	return cmp.Compare(info.MigrationCount, other.MigrationCount)
+}
+
+// Querier is the read-only database surface of Version and CheckReadiness.
+// *pgx.Conn, *pgxpool.Pool and pgx.Tx satisfy it, so a pool, a connection and
+// a transaction are all valid.
+type Querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Status reports the state of every migration version in the history and the
 // file set. It uses the same least-privilege session requirements as Migrate
 // and does not apply migrations.
@@ -163,6 +200,69 @@ func Plan(ctx context.Context, conn *pgx.Conn, config Config) ([]PlannedMigratio
 		return nil, err
 	}
 	return planned, nil
+}
+
+// Version reads the applied migration count and the highest version from the
+// metadata schema, mirroring max(version) and count(*) over the migration
+// history. A store whose metadata table does not exist yet reports a zero
+// VersionInfo. The querier needs USAGE on the metadata schema and SELECT on
+// the metadata table: the runtime role has neither in strict mode, so run
+// readiness checks with the owner role, for example SET ROLE app_owner, or
+// with a reader role granted access outside strict mode.
+func Version(ctx context.Context, querier Querier, config Config) (VersionInfo, error) {
+	if querier == nil {
+		return VersionInfo{}, errors.New("migration querier is required")
+	}
+	metaSchema, err := migrationSchemaIdentifier(config.MetaSchema, DefaultMetaSchema)
+	if err != nil {
+		return VersionInfo{}, err
+	}
+	metaTable := migrationMetaTableName(metaSchema)
+	var present bool
+	if queryErr := querier.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, metaTable).
+		Scan(&present); queryErr != nil {
+		return VersionInfo{}, fmt.Errorf("read schema version: %w", queryErr)
+	}
+	if !present {
+		return VersionInfo{}, nil
+	}
+	var info VersionInfo
+	if queryErr := querier.QueryRow(ctx, `
+		SELECT COALESCE(max(version), 0)::bigint, count(*)::bigint
+		FROM `+metaTable+`
+	`).Scan(&info.Version, &info.MigrationCount); queryErr != nil {
+		return VersionInfo{}, fmt.Errorf("read schema version: %w", queryErr)
+	}
+	return info, nil
+}
+
+// CheckReadiness compares the metadata store against expected and fails when
+// the store is empty, partially migrated, or newer than expected.
+func CheckReadiness(ctx context.Context, querier Querier, config Config, expected VersionInfo) error {
+	actual, err := Version(ctx, querier, config)
+	if err != nil {
+		return err
+	}
+	switch actual.Compare(expected) {
+	case 0:
+		return nil
+	case -1:
+		return fmt.Errorf(
+			"migration store is behind: version/count is %d/%d, expected %d/%d",
+			actual.Version,
+			actual.MigrationCount,
+			expected.Version,
+			expected.MigrationCount,
+		)
+	default:
+		return fmt.Errorf(
+			"migration store is ahead: version/count is %d/%d, expected %d/%d",
+			actual.Version,
+			actual.MigrationCount,
+			expected.Version,
+			expected.MigrationCount,
+		)
+	}
 }
 
 func buildMigrationStatuses(migrations []migration, applied []appliedMigration) []MigrationStatus {
@@ -244,9 +344,13 @@ func newMigrationPlan(config Config) (migrationPlan, error) {
 		role:           role,
 		roleIdentifier: roleIdentifier,
 		metaSchema:     metaSchema,
-		metaTable:      pgx.Identifier{metaSchema}.Sanitize() + ".schema_migrations",
+		metaTable:      migrationMetaTableName(metaSchema),
 		appSchema:      appSchema,
 	}, nil
+}
+
+func migrationMetaTableName(metaSchema string) string {
+	return pgx.Identifier{metaSchema}.Sanitize() + ".schema_migrations"
 }
 
 type migration struct {
@@ -545,7 +649,7 @@ func migrateFS(ctx context.Context, conn *pgx.Conn, config Config) error {
 			return err
 		}
 		for _, migration := range migrations[len(applied):] {
-			if applyErr := applyMigration(ctx, conn, plan, migration); applyErr != nil {
+			if applyErr := applyMigration(ctx, conn, plan, migration, config.StatementTimeout); applyErr != nil {
 				return applyErr
 			}
 		}
@@ -559,6 +663,9 @@ func withMigrationSession(
 	config Config,
 	action func(plan migrationPlan, migrations []migration, applied []appliedMigration) error,
 ) (returnErr error) {
+	if err := validateMigrationTimeouts(config); err != nil {
+		return err
+	}
 	plan, err := newMigrationPlan(config)
 	if err != nil {
 		return err
@@ -599,16 +706,63 @@ func withMigrationSession(
 			returnErr = errors.New("migration lock was not held at release")
 		}
 	}()
-	if _, execErr := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); execErr != nil {
-		return fmt.Errorf("acquire migration lock: %w", execErr)
+	if lockErr := acquireMigrationLock(ctx, conn, config.LockTimeout); lockErr != nil {
+		return lockErr
 	}
 	unlockNeeded = true
 
-	applied, err := readMigrationHistory(ctx, conn, plan)
+	applied, err := readMigrationHistory(ctx, conn, plan, config.StatementTimeout)
 	if err != nil {
 		return err
 	}
 	return action(plan, migrations, applied)
+}
+
+func validateMigrationTimeouts(config Config) error {
+	if config.LockTimeout < 0 {
+		return errors.New("lock timeout must not be negative")
+	}
+	if config.StatementTimeout < 0 {
+		return errors.New("statement timeout must not be negative")
+	}
+	return nil
+}
+
+// acquireMigrationLock takes the session advisory lock that serializes
+// migration runs. A zero timeout keeps the blocking pg_advisory_lock and
+// waits indefinitely. A positive timeout polls pg_try_advisory_lock against a
+// deadline: lock_timeout can abort a pg_advisory_lock wait while PostgreSQL
+// still grants the session-level lock, which would leak a lock held by no
+// caller, while a failed try never leaves a lock behind.
+func acquireMigrationLock(ctx context.Context, conn *pgx.Conn, timeout time.Duration) error {
+	if timeout <= 0 {
+		if _, execErr := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); execErr != nil {
+			return fmt.Errorf("acquire migration lock: %w", execErr)
+		}
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		var locked bool
+		if queryErr := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, migrationLockKey).
+			Scan(&locked); queryErr != nil {
+			return fmt.Errorf("acquire migration lock: %w", queryErr)
+		}
+		if locked {
+			return nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("acquire migration lock: %w after %s", ErrLockTimeout, timeout)
+		}
+		timer := time.NewTimer(min(remaining, migrationLockPollInterval))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("acquire migration lock: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func migrationIdentityAuthorized(ctx context.Context, conn *pgx.Conn, role string) (bool, error) {
@@ -686,12 +840,16 @@ func readMigrationHistory(
 	ctx context.Context,
 	conn *pgx.Conn,
 	plan migrationPlan,
+	statementTimeout time.Duration,
 ) ([]appliedMigration, error) {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin migration metadata transaction: %w", err)
 	}
 	defer rollbackMigration(tx)
+	if timeoutErr := setMigrationStatementTimeout(ctx, tx, statementTimeout); timeoutErr != nil {
+		return nil, fmt.Errorf("set statement timeout: %w", timeoutErr)
+	}
 	if _, execErr := tx.Exec(ctx, "SET LOCAL ROLE "+plan.roleIdentifier); execErr != nil {
 		return nil, fmt.Errorf("set migration role: %w", execErr)
 	}
@@ -937,12 +1095,21 @@ func verifyMigrationHistory(applied []appliedMigration, migrations []migration) 
 	return nil
 }
 
-func applyMigration(ctx context.Context, conn *pgx.Conn, plan migrationPlan, migration migration) error {
+func applyMigration(
+	ctx context.Context,
+	conn *pgx.Conn,
+	plan migrationPlan,
+	migration migration,
+	statementTimeout time.Duration,
+) error {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin migration %06d: %w", migration.Version, err)
 	}
 	defer rollbackMigration(tx)
+	if timeoutErr := setMigrationStatementTimeout(ctx, tx, statementTimeout); timeoutErr != nil {
+		return fmt.Errorf("set statement timeout for migration %06d: %w", migration.Version, timeoutErr)
+	}
 	if _, execErr := tx.Exec(ctx, "SET LOCAL ROLE "+plan.roleIdentifier); execErr != nil {
 		return fmt.Errorf("set role for migration %06d: %w", migration.Version, execErr)
 	}
@@ -968,4 +1135,18 @@ func rollbackMigration(tx pgx.Tx) {
 	rollbackCtx, cancel := context.WithTimeout(context.Background(), migrationCleanupTimeout)
 	defer cancel()
 	_ = tx.Rollback(rollbackCtx)
+}
+
+func migrationStatementTimeoutSQL(timeout time.Duration) string {
+	return fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", (timeout+time.Millisecond-1)/time.Millisecond)
+}
+
+func setMigrationStatementTimeout(ctx context.Context, tx pgx.Tx, timeout time.Duration) error {
+	if timeout <= 0 {
+		return nil
+	}
+	if _, execErr := tx.Exec(ctx, migrationStatementTimeoutSQL(timeout)); execErr != nil {
+		return execErr
+	}
+	return nil
 }

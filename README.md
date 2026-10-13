@@ -8,9 +8,11 @@ Apply PostgreSQL migrations with checksum drift detection, a transaction-control
 - Each file is scanned before execution. Top-level transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, `START TRANSACTION`, `PREPARE TRANSACTION`, `END`, `ABORT`) is rejected. Quoted text, dollar-quoted bodies, and comments do not count.
 - SHA-256 checksums and names are recorded in the `pgmig_meta.schema_migrations` table. A changed file fails the run before anything applies.
 - Every pending migration runs in one transaction under a `SET LOCAL ROLE` owner role. A failure rolls back the schema change and the history row together.
-- A session advisory lock serializes concurrent runners. A canceled run closes its connection instead of leaving a locked session behind.
+- A session advisory lock serializes concurrent runners. A canceled run closes its connection instead of leaving a locked session behind. A positive `LockTimeout` bounds the wait with a `pg_try_advisory_lock` poll loop; zero keeps the blocking wait.
+- `StatementTimeout` puts a transaction-local `statement_timeout` on every migration and metadata transaction, so no migration statement runs unbounded. A migration file can still override it with its own `SET LOCAL`.
 - The migration identity must be a least-privilege login, separated from the owner role. `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `REPLICATION`, `BYPASSRLS`, `INHERIT`, extra memberships, and direct owner logins are rejected.
 - Strict mode when `AppSchema` is set: the app schema must be owned by the owner role and granted `USAGE` to exactly one least-privilege runtime login. The database ACL must contain only the owner privileges and the two `CONNECT` grants. Any tampering fails before apply.
+- `Version` and `CheckReadiness` report whether the applied migration state matches the expected state, for readiness probes.
 
 ## Install
 
@@ -48,6 +50,8 @@ err = pgmig.Run(ctx, databaseURL, pgmig.Config{
 | `Files` | The migration set. Required. |
 | `MetaSchema` | The metadata schema. Defaults to `pgmig_meta`. |
 | `AppSchema` | The application schema. When set, strict role and ACL verification runs. |
+| `LockTimeout` | Bounds the wait for the migration advisory lock. Zero waits indefinitely. |
+| `StatementTimeout` | Sets a transaction-local `statement_timeout` on every migration and metadata transaction. Zero keeps the session default. |
 
 ## Inspect state
 
@@ -71,6 +75,33 @@ pgmig apply  -database-url "$DATABASE_URL" -dir ./migrations -role app_owner -dr
 `status` exits 0 even when versions are pending or drifted; `verify` exits 1
 on drift. Add `-app-schema` and `-meta-schema` to match the strict setup. The
 database URL can come from `PGMIG_DATABASE_URL` instead of the flag.
+
+## Readiness
+
+`Version` reads the applied migration state and `CheckReadiness` compares it
+against the expected state. Both accept any `Querier`: a `*pgx.Conn`, a
+`*pgxpool.Pool` or a `pgx.Tx`.
+
+```go
+version, err := pgmig.Version(ctx, pool, config)
+if err != nil {
+	return err
+}
+log.Printf("schema version %d with %d migrations", version.Version, version.MigrationCount)
+
+expected := pgmig.VersionInfo{Version: 42, MigrationCount: 42}
+if err := pgmig.CheckReadiness(ctx, pool, config, expected); err != nil {
+	return err
+}
+```
+
+A store that is empty or partially migrated fails as `behind`; one newer than
+expected fails as `ahead`. `VersionInfo.Compare` orders version first, then the
+applied count. The querier needs `USAGE` on the metadata schema and `SELECT`
+on the migration table. Strict mode requires that no role other than the owner
+holds metadata privileges, so run the check with the owner role, for example
+with `SET ROLE app_owner`, or with a reader role granted access when strict
+mode is not used.
 
 ## Provisioning for strict mode
 

@@ -108,3 +108,117 @@ func TestInspectIntegration(t *testing.T) {
 	}
 	assertErrorContains(t, Verify(ctx, migrator, partialConfig), "unknown migration")
 }
+
+func TestVersionReadinessIntegration(t *testing.T) {
+	adminURL := strings.TrimSpace(os.Getenv(testDatabaseEnv))
+	if adminURL == "" {
+		t.Skip("set " + testDatabaseEnv + " to run PostgreSQL integration tests")
+	}
+	admin := connect(t, adminURL)
+	defer func() { _ = admin.Close(context.Background()) }()
+	resetDatabase(t, admin)
+	ctx := context.Background()
+
+	migrator := connect(t, databaseURLForRole(t, adminURL, testMigratorRole, testMigratorPassword))
+	defer func() { _ = migrator.Close(ctx) }()
+	readiness := connect(t, databaseURLForRole(t, adminURL, testMigratorRole, testMigratorPassword))
+	defer func() { _ = readiness.Close(ctx) }()
+	if _, err := readiness.Exec(ctx, "SET ROLE "+testOwnerRole); err != nil {
+		t.Fatalf("raise readiness session to the owner role: %v", err)
+	}
+
+	alpha := []byte("CREATE TABLE app.alpha (id integer PRIMARY KEY);\n")
+	beta := []byte("CREATE TABLE app.beta (id integer);\n")
+	firstConfig := Config{
+		Role:      testOwnerRole,
+		AppSchema: testAppSchema,
+		Files:     fstest.MapFS{"000001_alpha.sql": {Data: alpha}},
+	}
+
+	empty, err := Version(ctx, readiness, firstConfig)
+	if err != nil {
+		t.Fatalf("Version before apply: %v", err)
+	}
+	if empty != (VersionInfo{}) {
+		t.Fatalf("empty VersionInfo = %+v", empty)
+	}
+	emptyErr := CheckReadiness(ctx, readiness, firstConfig, VersionInfo{Version: 1, MigrationCount: 1})
+	assertErrorContains(t, emptyErr, "behind")
+	assertErrorContains(t, emptyErr, "0/0")
+
+	if err := Migrate(ctx, migrator, firstConfig); err != nil {
+		t.Fatalf("apply first migration: %v", err)
+	}
+	partial, err := Version(ctx, readiness, firstConfig)
+	if err != nil {
+		t.Fatalf("Version after first apply: %v", err)
+	}
+	if partial != (VersionInfo{Version: 1, MigrationCount: 1}) {
+		t.Fatalf("partial VersionInfo = %+v", partial)
+	}
+
+	fullConfig := Config{
+		Role:      testOwnerRole,
+		AppSchema: testAppSchema,
+		Files: fstest.MapFS{
+			"000001_alpha.sql": {Data: alpha},
+			"000002_beta.sql":  {Data: beta},
+		},
+	}
+	partialErr := CheckReadiness(ctx, readiness, fullConfig, VersionInfo{Version: 2, MigrationCount: 2})
+	assertErrorContains(t, partialErr, "behind")
+	assertErrorContains(t, partialErr, "1/1")
+
+	if err := Migrate(ctx, migrator, fullConfig); err != nil {
+		t.Fatalf("apply second migration: %v", err)
+	}
+	full, err := Version(ctx, readiness, fullConfig)
+	if err != nil {
+		t.Fatalf("Version after full apply: %v", err)
+	}
+	if full != (VersionInfo{Version: 2, MigrationCount: 2}) {
+		t.Fatalf("full VersionInfo = %+v", full)
+	}
+	if err := CheckReadiness(ctx, readiness, fullConfig, full); err != nil {
+		t.Fatalf("CheckReadiness at the applied version: %v", err)
+	}
+	aheadErr := CheckReadiness(ctx, readiness, fullConfig, VersionInfo{Version: 1, MigrationCount: 1})
+	assertErrorContains(t, aheadErr, "ahead")
+	assertErrorContains(t, aheadErr, "2/2")
+
+	tx, err := readiness.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin readiness transaction: %v", err)
+	}
+	txVersion, err := Version(ctx, tx, fullConfig)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("Version on a transaction: %v", err)
+	}
+	if txVersion != full {
+		t.Fatalf("transaction VersionInfo = %+v", txVersion)
+	}
+	if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+		t.Fatalf("rollback readiness transaction: %v", rollbackErr)
+	}
+
+	customConfig := Config{
+		Role:       testOwnerRole,
+		AppSchema:  testAppSchema,
+		MetaSchema: "custom_meta",
+		Files: fstest.MapFS{
+			"000001_probe.sql":  {Data: []byte("SELECT 1;\n")},
+			"000002_probe2.sql": {Data: []byte("SELECT 2;\n")},
+		},
+	}
+	if err := Migrate(ctx, migrator, customConfig); err != nil {
+		t.Fatalf("apply custom metadata schema: %v", err)
+	}
+	custom, err := Version(ctx, readiness, customConfig)
+	if err != nil {
+		t.Fatalf("Version on custom metadata schema: %v", err)
+	}
+	if custom != full {
+		t.Fatalf("custom metadata VersionInfo = %+v", custom)
+	}
+}

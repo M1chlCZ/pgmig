@@ -7,7 +7,16 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+type stubQuerier struct{}
+
+func (stubQuerier) QueryRow(context.Context, string, ...any) pgx.Row {
+	return nil
+}
 
 func TestRunRejectsMissingOrInvalidDatabaseURL(t *testing.T) {
 	t.Parallel()
@@ -199,5 +208,120 @@ func TestValidateMigrationSQLRejectsUnterminatedProtectedText(t *testing.T) {
 		if err := validateMigrationSQL(sql); err == nil {
 			t.Fatalf("validateMigrationSQL accepted unterminated SQL %q", sql)
 		}
+	}
+}
+
+func TestValidateMigrationTimeoutsAcceptZeroAndPositiveValues(t *testing.T) {
+	t.Parallel()
+
+	configs := []Config{
+		{},
+		{LockTimeout: time.Second},
+		{StatementTimeout: time.Minute},
+		{LockTimeout: time.Second, StatementTimeout: 2 * time.Minute},
+	}
+	for _, config := range configs {
+		if err := validateMigrationTimeouts(config); err != nil {
+			t.Fatalf("validateMigrationTimeouts rejected %+v: %v", config, err)
+		}
+	}
+}
+
+func TestValidateMigrationTimeoutsRejectNegativeValues(t *testing.T) {
+	t.Parallel()
+
+	for _, config := range []Config{
+		{LockTimeout: -time.Second},
+		{StatementTimeout: -time.Millisecond},
+		{LockTimeout: -time.Second, StatementTimeout: -time.Second},
+	} {
+		if err := validateMigrationTimeouts(config); err == nil {
+			t.Fatalf("validateMigrationTimeouts accepted %+v", config)
+		}
+	}
+}
+
+func TestMigrationStatementTimeoutSQLRoundsUpToWholeMilliseconds(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		timeout time.Duration
+		want    string
+	}{
+		{timeout: time.Millisecond, want: "SET LOCAL statement_timeout = '1ms'"},
+		{timeout: 250 * time.Millisecond, want: "SET LOCAL statement_timeout = '250ms'"},
+		{timeout: 2 * time.Minute, want: "SET LOCAL statement_timeout = '120000ms'"},
+		{timeout: 1500 * time.Microsecond, want: "SET LOCAL statement_timeout = '2ms'"},
+	} {
+		t.Run(tt.want, func(t *testing.T) {
+			t.Parallel()
+			if got := migrationStatementTimeoutSQL(tt.timeout); got != tt.want {
+				t.Fatalf("migrationStatementTimeoutSQL(%s) = %q, want %q", tt.timeout, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVersionRejectsMissingQuerierAndInvalidMetaSchema(t *testing.T) {
+	t.Parallel()
+
+	if _, err := Version(context.Background(), nil, Config{}); err == nil {
+		t.Fatal("Version accepted a nil querier")
+	}
+	if _, err := Version(context.Background(), stubQuerier{}, Config{MetaSchema: "Bad Schema"}); err == nil {
+		t.Fatal("Version accepted an invalid metadata schema")
+	}
+}
+
+func TestVersionInfoCompareOrdersVersionThenCount(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		left  VersionInfo
+		right VersionInfo
+		want  int
+	}{
+		{name: "empty and equal", left: VersionInfo{}, right: VersionInfo{}, want: 0},
+		{
+			name:  "identical applied stores",
+			left:  VersionInfo{Version: 4, MigrationCount: 4},
+			right: VersionInfo{Version: 4, MigrationCount: 4},
+			want:  0,
+		},
+		{
+			name:  "empty store is older",
+			left:  VersionInfo{},
+			right: VersionInfo{Version: 1, MigrationCount: 1},
+			want:  -1,
+		},
+		{
+			name:  "partial store with equal version is older",
+			left:  VersionInfo{Version: 4, MigrationCount: 3},
+			right: VersionInfo{Version: 4, MigrationCount: 4},
+			want:  -1,
+		},
+		{
+			name:  "higher version wins over count",
+			left:  VersionInfo{Version: 5, MigrationCount: 1},
+			right: VersionInfo{Version: 4, MigrationCount: 99},
+			want:  1,
+		},
+		{
+			name:  "extra recorded rows with equal version are newer",
+			left:  VersionInfo{Version: 4, MigrationCount: 5},
+			right: VersionInfo{Version: 4, MigrationCount: 4},
+			want:  1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.left.Compare(tt.right); got != tt.want {
+				t.Fatalf("Compare = %d, want %d", got, tt.want)
+			}
+			if got := tt.right.Compare(tt.left); got != -tt.want {
+				t.Fatalf("reverse Compare = %d, want %d", got, -tt.want)
+			}
+		})
 	}
 }

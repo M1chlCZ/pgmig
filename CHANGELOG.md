@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file. The format
 follows Keep a Changelog, and the project uses semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- `Config.LockTimeout` bounds the wait for the migration advisory lock with a
+  `pg_try_advisory_lock` poll loop; a zero timeout keeps the blocking wait.
+  `ErrLockTimeout` identifies the exhausted wait.
+- `Config.StatementTimeout` puts a transaction-local `statement_timeout` on
+  every migration and metadata transaction. A migration file can override it
+  with its own `SET LOCAL`.
+- `Version` and `CheckReadiness` read the applied migration count and the
+  latest version through any `Querier` (`*pgx.Conn`, `*pgxpool.Pool` or
+  `pgx.Tx`) and compare them against an expected `VersionInfo`.
+
+### Changed
+
+- `Migrate`, `Run`, `Status`, `Verify` and `Plan` reject negative lock or
+  statement timeouts.
+
 ## [0.2.0] - 2026-10-31
 
 ### Added
